@@ -1,0 +1,48 @@
+INFO:root:Loading datasets...
+INFO:root:Train: 955 samples, Val: 239 samples
+INFO:root:Views: 2 global + 4 local
+INFO:root:Creating model: vit_small_patch16_224.augreg_in21k
+INFO:timm.models._builder:Loading pretrained weights from Hugging Face hub (timm/vit_small_patch16_224.augreg_in21k)
+INFO:httpx:HTTP Request: HEAD https://huggingface.co/timm/vit_small_patch16_224.augreg_in21k/resolve/main/model.safetensors "HTTP/1.1 302 Found"
+INFO:timm.models._hub:[timm/vit_small_patch16_224.augreg_in21k] Safe alternative available for 'pytorch_model.bin' (as 'model.safetensors'). Loading weights using safetensors.
+/home/users/aho13/jepa_tests/env/lib/python3.10/site-packages/torch/cuda/__init__.py:283: UserWarning: 
+    Found GPU0 Tesla P100-PCIE-12GB which is of cuda capability 6.0.
+    Minimum and Maximum cuda capability supported by this version of PyTorch is
+    (7.0) - (12.0)
+    
+  warnings.warn(
+/home/users/aho13/jepa_tests/env/lib/python3.10/site-packages/torch/cuda/__init__.py:304: UserWarning: 
+    Please install PyTorch with a following CUDA
+    configurations:  12.6 following instructions at
+    https://pytorch.org/get-started/locally/
+    
+  warnings.warn(matched_cuda_warn.format(matched_arches))
+/home/users/aho13/jepa_tests/env/lib/python3.10/site-packages/torch/cuda/__init__.py:326: UserWarning: 
+Tesla P100-PCIE-12GB with CUDA capability sm_60 is not compatible with the current PyTorch installation.
+The current PyTorch install supports CUDA capabilities sm_70 sm_75 sm_80 sm_86 sm_90 sm_100 sm_120.
+If you want to use the Tesla P100-PCIE-12GB GPU with PyTorch, please check the instructions at https://pytorch.org/get-started/locally/
+
+  warnings.warn(
+Traceback (most recent call last):
+  File "/home/users/aho13/aipi-540-cv-hackathon/train_depth_jepa.py", line 377, in <module>
+    main()
+  File "/home/users/aho13/aipi-540-cv-hackathon/train_depth_jepa.py", line 195, in main
+    model = model.to(torch.bfloat16)
+  File "/home/users/aho13/jepa_tests/env/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1371, in to
+    return self._apply(convert)
+  File "/home/users/aho13/jepa_tests/env/lib/python3.10/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/home/users/aho13/jepa_tests/env/lib/python3.10/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/home/users/aho13/jepa_tests/env/lib/python3.10/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/home/users/aho13/jepa_tests/env/lib/python3.10/site-packages/torch/nn/modules/module.py", line 957, in _apply
+    param_applied = fn(param)
+  File "/home/users/aho13/jepa_tests/env/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1357, in convert
+    return t.to(
+torch.AcceleratorError: CUDA error: no kernel image is available for execution on the device
+Search for `cudaErrorNoKernelImageForDevice' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+

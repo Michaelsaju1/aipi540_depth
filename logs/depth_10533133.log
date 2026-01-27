@@ -1,0 +1,2 @@
+DepthDataset [train]: 955 samples, multi_view=True, V_global=2, V_local=4
+DepthDataset [val]: 239 samples, multi_view=False, V_global=2, V_local=4

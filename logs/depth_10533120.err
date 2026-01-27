@@ -1,0 +1,7 @@
+INFO:root:Loading datasets...
+Traceback (most recent call last):
+  File "/home/users/aho13/aipi-540-cv-hackathon/train_depth.py", line 284, in <module>
+    main()
+  File "/home/users/aho13/aipi-540-cv-hackathon/train_depth.py", line 97, in main
+    train_ds = DepthDataset(
+TypeError: DepthDataset.__init__() got an unexpected keyword argument 'img_size'

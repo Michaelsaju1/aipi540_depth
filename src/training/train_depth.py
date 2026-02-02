@@ -20,9 +20,9 @@ import logging
 import tqdm
 import wandb
 
-from depth_ds import DepthDataset, collate_depth
-from depth_model import DepthViT, ScaleInvariantLoss, DepthSmoothL1Loss
-from loss import SIGReg
+from src.data.depth_ds import DepthDataset, collate_depth
+from src.models.depth_model import get_depth_model, ScaleInvariantLoss, DepthSmoothL1Loss
+from src.losses.loss import SIGReg
 
 logging.basicConfig(level=logging.INFO)
 
@@ -44,37 +44,6 @@ def parse_args():
     parser.add_argument("--save_path", type=str, default="checkpoints/depth_model.pt")
     return parser.parse_args()
 
-
-def compute_metrics(pred, target):
-    """Compute depth estimation metrics."""
-    # Ensure same shape
-    pred = pred.detach()
-    target = target.detach()
-    
-    # Avoid division by zero
-    eps = 1e-6
-    pred = pred.clamp(min=eps)
-    target = target.clamp(min=eps)
-    
-    # Absolute Relative Error
-    abs_rel = torch.mean(torch.abs(pred - target) / target)
-    
-    # RMSE
-    rmse = torch.sqrt(torch.mean((pred - target) ** 2))
-    
-    # Delta thresholds (% of pixels where max(pred/gt, gt/pred) < threshold)
-    ratio = torch.max(pred / target, target / pred)
-    delta1 = (ratio < 1.25).float().mean()
-    delta2 = (ratio < 1.25 ** 2).float().mean()
-    delta3 = (ratio < 1.25 ** 3).float().mean()
-    
-    return {
-        "abs_rel": abs_rel.item(),
-        "rmse": rmse.item(),
-        "delta1": delta1.item(),
-        "delta2": delta2.item(),
-        "delta3": delta3.item(),
-    }
 
 
 def main():
@@ -128,7 +97,7 @@ def main():
     
     # Model
     logging.info(f"Creating model: {args.model}")
-    model = DepthViT(
+    model = get_depth_model(
         model_name=args.model,
         img_size=args.img_size,
         pretrained=True,

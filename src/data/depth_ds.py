@@ -11,6 +11,7 @@ Supports:
 
 import torch
 from torch.utils.data import Dataset
+import torch.nn.functional as F
 from torchvision.transforms import v2
 import torchvision.transforms.functional as TF
 from torchvision.transforms import InterpolationMode
@@ -37,8 +38,7 @@ class DepthDataset(Dataset):
         split="train",
         global_img_size=224,
         local_img_size=96,
-        data_root="datalink/neighbourhood",
-        neighborhoods=None,  # List of neighborhood IDs, e.g. [0, 1, 2] or None for all
+        data_root=f"{os.getcwd()}/datalink/cache/datasets--benediktkol--DDOS/snapshots/1ed1314d32ef3a5a7e1434000783a8433517bd0e/data/",
         depth_max=65535.0,   # Max depth value for normalization
         V_global=2,          # Number of global views (for JEPA)
         V_local=4,           # Number of local views (for JEPA)
@@ -48,24 +48,29 @@ class DepthDataset(Dataset):
         self.global_img_size = global_img_size
         self.local_img_size = local_img_size
         self.depth_max = depth_max
-        self.data_root = data_root
+        self.data_root = os.path.join(
+            os.getcwd(),
+            "datalink",
+            "cache/datasets--benediktkol--DDOS/snapshots/1ed1314d32ef3a5a7e1434000783a8433517bd0e/data/"
+        )
         self.V_global = V_global
         self.V_local = V_local
         self.multi_view = multi_view
         
         # Collect all image/depth pairs
-        self.samples = self._collect_samples(neighborhoods)
-        
-        # Split train/val (80/20)
+        # Split train/val (95/5)
+        self.samples = self._collect_samples()
         rng = random.Random(42)
         indices = list(range(len(self.samples)))
         rng.shuffle(indices)
-        split_idx = int(0.8 * len(indices))
-        
+        split_idx = int(0.95 * len(indices))
         if split == "train":
             self.samples = [self.samples[i] for i in indices[:split_idx]]
-        else:
+        elif split == "val":
             self.samples = [self.samples[i] for i in indices[split_idx:]]
+        
+        
+        
         
         print(f"DepthDataset [{split}]: {len(self.samples)} samples, "
               f"multi_view={multi_view}, V_global={V_global}, V_local={V_local}")
@@ -75,46 +80,23 @@ class DepthDataset(Dataset):
             v2.RandomApply([v2.ColorJitter(0.4, 0.4, 0.2, 0.1)], p=0.8),
             v2.RandomGrayscale(p=0.1),
         ])
-        
-    def _resolve_symlink(self, symlink_path):
-        """
-        Resolve a symlink to its actual blob path.
-        
-        The neighbourhood symlinks point to ../../../../../../../blobs/HASH
-        but the blobs are actually in datalink/cache/datasets--benediktkol--DDOS/blobs/
-        """
-        if not os.path.islink(symlink_path):
-            return symlink_path if os.path.exists(symlink_path) else None
-        
-        target = os.readlink(symlink_path)
-        # Extract the hash from the symlink target
-        blob_hash = os.path.basename(target)
-        
-        # Construct the correct blob path
-        blob_path = os.path.join(
-            os.path.dirname(self.data_root),  # datalink
-            "cache", "datasets--benediktkol--DDOS", "blobs", blob_hash
-        )
-        
-        if os.path.exists(blob_path):
-            return blob_path
-        return None
     
-    def _collect_samples(self, neighborhoods):
+    def _collect_samples(self):
         """Gather all (image_path, depth_path) pairs."""
         samples = []
         
         # Get all neighborhood folders
-        if neighborhoods is None:
-            folders = [d for d in os.listdir(self.data_root) 
-                      if os.path.isdir(os.path.join(self.data_root, d)) and d.isdigit()]
-        else:
-            folders = [str(n) for n in neighborhoods]
+        dir_split = "train" if self.split == "val" else self.split
+        data_dir = f"{self.data_root}{dir_split}/neighbourhood"
+        
+        folders = [d for d in os.listdir(data_dir) 
+                    if os.path.isdir(os.path.join(data_dir, d)) and d.isdigit()]
+        # print(folders)
         
         for folder in folders:
-            img_dir = os.path.join(self.data_root, folder, "image")
-            depth_dir = os.path.join(self.data_root, folder, "depth")
-            
+            img_dir = os.path.join(data_dir, folder, "image")
+            depth_dir = os.path.join(data_dir, folder, "depth")
+            # print(img_dir)
             if not os.path.isdir(img_dir) or not os.path.isdir(depth_dir):
                 continue
             
@@ -122,15 +104,11 @@ class DepthDataset(Dataset):
             for img_name in os.listdir(img_dir):
                 if not img_name.endswith('.png'):
                     continue
-                    
-                img_symlink = os.path.join(img_dir, img_name)
-                depth_symlink = os.path.join(depth_dir, img_name)
-                
-                # Resolve symlinks to actual blob paths
-                img_file = self._resolve_symlink(img_symlink)
-                depth_file = self._resolve_symlink(depth_symlink)
-                
+                img_file = os.path.join(img_dir, img_name)
+                depth_file = os.path.join(depth_dir, img_name)
+
                 if img_file and depth_file:
+                    # print (img_file)
                     samples.append((img_file, depth_file))
         
         return samples
@@ -204,7 +182,12 @@ class DepthDataset(Dataset):
         return img_tensor, depth_tensor
     
     def _get_single_view(self, img, depth):
-        """Get a single view for simple training or validation."""
+        """
+        Get a single view.
+        
+        Train: Random crop + flip
+        Val/Test: Grid of non-overlapping patches covering the full image
+        """
         if self.split == "train":
             # Synchronized random crop
             img, depth = self._synchronized_crop(
@@ -217,14 +200,61 @@ class DepthDataset(Dataset):
             if random.random() > 0.5:
                 img = TF.hflip(img)
                 depth = TF.hflip(depth)
+                
+            return self._to_tensor_pair(img, depth)
+            
         else:
-            # Deterministic center crop for validation
-            img = TF.resize(img, 256, InterpolationMode.BILINEAR)
-            depth = TF.resize(depth, 256, InterpolationMode.NEAREST)
-            img = TF.center_crop(img, self.global_img_size)
-            depth = TF.center_crop(depth, self.global_img_size)
-        
-        return self._to_tensor_pair(img, depth)
+            # Deterministic patching for validation / test
+            patch_size = self.global_img_size
+            
+            # Convert to tensors first 
+            # Note: _to_tensor_pair does normalization, so we do it manually here 
+            # to handle the full image before patching
+            
+            # RGB normalization constants
+            mean = [0.485, 0.456, 0.406]
+            std = [0.229, 0.224, 0.225]
+            
+            # Prepare Image
+            img_t = TF.to_tensor(img) # (3, H, W)
+            img_t = TF.normalize(img_t, mean=mean, std=std)
+            
+            # Prepare Depth
+            depth_arr = np.array(depth, dtype=np.float32)
+            depth_t = torch.from_numpy(depth_arr).unsqueeze(0) # (1, H, W)
+            depth_t = depth_t / self.depth_max
+            depth_t = depth_t.clamp(0, 1)
+            
+            # Pad to multiple of patch_size
+            _, H, W = img_t.shape
+            pad_h = (patch_size - H % patch_size) % patch_size
+            pad_w = (patch_size - W % patch_size) % patch_size
+            
+            if pad_h > 0 or pad_w > 0:
+                img_t = F.pad(img_t, (0, pad_w, 0, pad_h), mode='reflect')
+                depth_t = F.pad(depth_t, (0, pad_w, 0, pad_h), mode='replicate')
+                
+            # Unfold into patches
+            # Input to unfold must be (N, C, H, W)
+            img_t = img_t.unsqueeze(0)
+            depth_t = depth_t.unsqueeze(0)
+            
+            # (1, C*P*P, L) where L is number of patches
+            img_patches = F.unfold(img_t, kernel_size=patch_size, stride=patch_size)
+            depth_patches = F.unfold(depth_t, kernel_size=patch_size, stride=patch_size)
+            
+            # Reshape to (L, C, P, P)
+            # 1. Transpose to (1, L, C*P*P) -> squeeze to (L, C*P*P)
+            # 2. View as (L, C, P, P)
+            L = img_patches.size(2)
+            
+            img_patches = img_patches.transpose(1, 2).squeeze(0)
+            img_patches = img_patches.view(L, 3, patch_size, patch_size)
+            
+            depth_patches = depth_patches.transpose(1, 2).squeeze(0)
+            depth_patches = depth_patches.view(L, 1, patch_size, patch_size)
+            
+            return img_patches, depth_patches, (H, W)
     
     def _get_multi_view(self, img, depth):
         """
@@ -296,14 +326,33 @@ class DepthDataset(Dataset):
 def collate_depth(batch):
     """
     Collate function for single-view depth dataset.
+    Handles both single tensors (Training) and stacks of patches (Validation).
     
+    Args:
+        batch: List of (img, depth)
+        
     Returns:
-        images: (B, 3, H, W)
-        depths: (B, 1, H, W)
+        images: (B_total, 3, H, W)
+        depths: (B_total, 1, H, W)
+        patch_counts: List[int] or None. Number of patches per original image. 
+                      None for single-view training.
     """
-    images = torch.stack([b[0] for b in batch])
-    depths = torch.stack([b[1] for b in batch])
-    return images, depths
+    # Check if elements are 3D tensors (single view) or 4D tensors (patches)
+    elem_img = batch[0][0]
+    
+    if elem_img.ndim == 3: # (C, H, W) - Training / Single View
+        images = torch.stack([b[0] for b in batch])
+        depths = torch.stack([b[1] for b in batch])
+        patch_counts = None
+        shapes = None
+    else: # (N_patches, C, H, W) - Validation / Patches
+        # Concatenate all patches from all images in the batch
+        images = torch.cat([b[0] for b in batch], dim=0)
+        depths = torch.cat([b[1] for b in batch], dim=0)
+        patch_counts = [b[0].shape[0] for b in batch]
+        shapes = [b[2] for b in batch]
+        
+    return images, depths, patch_counts, shapes
 
 
 def collate_depth_multiview(batch):
@@ -355,13 +404,81 @@ def collate_depth_multiview(batch):
     return img_views_stacked, depth_views_stacked
 
 
+class DepthDatasetFull(DepthDataset):
+    """
+    Dataset for full-image training (adaptive sizes) with ResNet.
+    
+    Resizes images to be divisible by 32 (stride of ResNet50)
+    while maintaining aspect ratio, up to max_img_size.
+    """
+    
+    def __init__(
+        self, 
+        split="train",
+        max_img_size=1536, # Multiple of 32 close to 1500
+        data_root=None, # Use default from parent if None
+        depth_max=65535.0,
+        multi_view=True, # If True, returns [img], [depth] lists for compatibility
+    ):
+        # Initialize parent to get file lists
+        super().__init__(
+            split=split,
+            data_root=data_root if data_root else f"{os.getcwd()}/datalink/cache/datasets--benediktkol--DDOS/snapshots/1ed1314d32ef3a5a7e1434000783a8433517bd0e/data/",
+            depth_max=depth_max,
+            multi_view=multi_view
+        )
+        self.max_img_size = max_img_size
+        
+        print(f"DepthDatasetFull [{split}]: {len(self.samples)} samples, max_size={max_img_size}")
+        
+    def _resize_adaptive(self, img, depth):
+        """
+        Resize to max_img_size while keeping aspect ratio and ensuring % 32 == 0.
+        """
+        w, h = img.size
+        
+        # Scale to max dimension
+        scale = min(self.max_img_size / w, self.max_img_size / h)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        
+        # Round to nearest multiple of 32
+        new_w = round(new_w / 32) * 32
+        new_h = round(new_h / 32) * 32
+        
+        # Resize
+        img = img.resize((new_w, new_h), Image.BILINEAR)
+        depth = depth.resize((new_w, new_h), Image.NEAREST)
+        
+        return img, depth
+
+    def __getitem__(self, idx):
+        img_path, depth_path = self.samples[idx]
+        
+        img = Image.open(img_path).convert("RGB")
+        depth = Image.open(depth_path)
+        
+        # Resize
+        img, depth = self._resize_adaptive(img, depth)
+        
+        # To Tensor
+        img_t, depth_t = self._to_tensor_pair(img, depth)
+        
+        if self.multi_view:
+            # Return as list of views (length 1) for compatibility
+            return [img_t], [depth_t]
+        else:
+            return img_t, depth_t
+
+
+
 # Quick test
 if __name__ == "__main__":
     print("=== Single View Mode ===")
     ds_single = DepthDataset(
-        split="train", 
+        split="test", 
         global_img_size=224,
-        neighborhoods=[0, 1, 2],
+        # neighborhoods=[0, 1, 2],
         multi_view=False
     )
     print(f"Dataset size: {len(ds_single)}")
@@ -376,7 +493,7 @@ if __name__ == "__main__":
         split="train",
         global_img_size=224,
         local_img_size=96,
-        neighborhoods=[0, 1, 2],
+        # neighborhoods=[0, 1, 2],
         V_global=2,
         V_local=4,
         multi_view=True

@@ -3,6 +3,7 @@ Depth Estimation Model using ViT Encoder + Decoder.
 
 Architecture:
 - ViT encoder extracts patch features (14x14 grid for 224px input with patch16)
+- ResNet encoder extracts features (stride 32)
 - Simple decoder upsamples back to input resolution
 - Outputs single-channel depth map
 """
@@ -21,38 +22,43 @@ class DepthDecoder(nn.Module):
     For ViT-small with patch16 on 224px: (B, 384, 14, 14) -> (B, 1, 224, 224)
     """
     
-    def __init__(self, in_channels=384, hidden_channels=256, out_size=224):
+    def __init__(self, in_channels=384, hidden_channels=256, out_size=224, num_upsample=4):
         super().__init__()
         self.out_size = out_size
-        
         # Progressive upsampling: 14 -> 28 -> 56 -> 112 -> 224
-        self.up1 = nn.Sequential(
-            nn.ConvTranspose2d(in_channels, hidden_channels, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(hidden_channels),
-            nn.GELU(),
-        )  # 14 -> 28
+
+        hc_sizes = [
+            in_channels,
+            hidden_channels,
+            hidden_channels // 2,
+            hidden_channels // 4,
+            hidden_channels // 8,
+            32,
+        ]
         
-        self.up2 = nn.Sequential(
-            nn.ConvTranspose2d(hidden_channels, hidden_channels // 2, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(hidden_channels // 2),
-            nn.GELU(),
-        )  # 28 -> 56
-        
-        self.up3 = nn.Sequential(
-            nn.ConvTranspose2d(hidden_channels // 2, hidden_channels // 4, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(hidden_channels // 4),
-            nn.GELU(),
-        )  # 56 -> 112
-        
-        self.up4 = nn.Sequential(
-            nn.ConvTranspose2d(hidden_channels // 4, hidden_channels // 8, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(hidden_channels // 8),
-            nn.GELU(),
-        )  # 112 -> 224
+        # Adjust for extra upsampling if needed (e.g. for ResNet stride 32)
+        if num_upsample == 5:
+            hc_sizes = [
+                in_channels,      # e.g. 2048
+                hidden_channels, # 512
+                hidden_channels//2,     # 256
+                hidden_channels // 4, # 128
+                hidden_channels // 8, # 64
+                32,
+            ]
+
+        self.net = nn.Sequential(*[ 
+            nn.Sequential(
+                nn.ConvTranspose2d(hc_sizes[i], hc_sizes[i+1], kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm2d(hc_sizes[i+1]),
+                nn.GELU(),
+            )
+            for i in range(num_upsample)
+        ])
         
         # Final prediction head
         self.head = nn.Sequential(
-            nn.Conv2d(hidden_channels // 8, 32, kernel_size=3, padding=1),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv2d(32, 1, kernel_size=1),
             nn.Sigmoid(),  # Output in [0, 1] for normalized depth
@@ -63,13 +69,10 @@ class DepthDecoder(nn.Module):
         x: (B, D, H_patch, W_patch) - spatial features from ViT
         Returns: (B, 1, H_img, W_img) - depth map
         """
-        x = self.up1(x)
-        x = self.up2(x)
-        x = self.up3(x)
-        x = self.up4(x)
+        x = self.net(x)
         x = self.head(x)
         
-        # Ensure exact output size
+        # Ensure exact output size (in case input wasn't perfect multiple)
         if x.shape[-1] != self.out_size:
             x = F.interpolate(x, size=(self.out_size, self.out_size), mode='bilinear', align_corners=False)
         
@@ -92,6 +95,7 @@ class DepthViT(nn.Module):
         img_size=224,
         pretrained=True,
         freeze_encoder=False,
+        num_upsample=4,
     ):
         super().__init__()
         self.img_size = img_size
@@ -121,7 +125,8 @@ class DepthViT(nn.Module):
         self.decoder = DepthDecoder(
             in_channels=self.feat_dim,
             hidden_channels=256,
-            out_size=img_size
+            out_size=img_size,
+            num_upsample=num_upsample
         )
         
         # For JEPA: projection head to get embedding for SIGReg
@@ -184,6 +189,81 @@ class DepthViT(nn.Module):
             return depth, embedding
         
         return depth
+
+
+class DepthResNet(nn.Module):
+    """
+    ResNet-based depth estimation model.
+    Supports varying input sizes.
+    """
+    
+    def __init__(
+        self,
+        model_name="resnet50.a1_in1k",
+        img_size=224, # Used for decoder target size
+        pretrained=True,
+        freeze_encoder=False,
+    ):
+        super().__init__()
+        
+        self.img_size = img_size
+        
+        # Create ResNet backbone
+        # features_only=True returns a list of features from different stages
+        # out_indices=(4,) gives us the final feature map (stride 32)
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            features_only=True,
+            out_indices=(4,),
+        )
+        
+        self.feat_dim = self.backbone.feature_info[0]['num_chs'] # Should be 2048 for ResNet50
+        
+        if freeze_encoder:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+        
+        # Decoder for ResNet (stride 32 -> 5 upsamples)
+        self.decoder = DepthDecoder(
+            in_channels=self.feat_dim,
+            hidden_channels=256, 
+            out_size=img_size,
+            num_upsample=5
+        )
+        
+        # Projection head for JEPA/SIGReg
+        # Global pooling for embedding
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.proj = nn.Sequential(
+            nn.Linear(self.feat_dim, 2048),
+            nn.BatchNorm1d(2048),
+            nn.GELU(),
+            nn.Linear(2048, 512),
+            nn.BatchNorm1d(512, affine=False),
+        )
+
+    def forward(self, x, return_embedding=False):
+        # x: (B, 3, H, W)
+        features = self.backbone(x) # List of one tensor
+        x_feat = features[0] # (B, 2048, H/32, W/32)
+        
+        # Map to depth
+        depth = self.decoder(x_feat)
+        
+        if return_embedding:
+            # Global Average Pooling for embedding
+            pooled = self.pool(x_feat).flatten(1)
+            embedding = self.proj(pooled)
+            return depth, embedding
+            
+        return depth
+
+def get_depth_model(model_name, **kwargs):
+    if "resnet" in model_name:
+        return DepthResNet(model_name=model_name, **kwargs)
+    else:
+        return DepthViT(model_name=model_name, **kwargs)
 
 
 class ScaleInvariantLoss(nn.Module):
@@ -260,19 +340,16 @@ class DepthSmoothL1Loss(nn.Module):
 
 # Test
 if __name__ == "__main__":
+    # Test ViT
+    print("Testing ViT...")
     model = DepthViT(model_name="vit_small_patch16_224.augreg_in21k", img_size=224)
-    print(f"Model feature dim: {model.feat_dim}")
-    print(f"Grid size: {model.grid_size}")
-    
-    # Test forward pass
     x = torch.randn(2, 3, 224, 224)
     depth, emb = model(x, return_embedding=True)
-    print(f"Input: {x.shape}")
-    print(f"Depth output: {depth.shape}")
-    print(f"Embedding: {emb.shape}")
+    print(f"ViT Output: {depth.shape}, Emb: {emb.shape}")
     
-    # Test loss
-    target = torch.rand(2, 1, 224, 224)
-    loss_fn = ScaleInvariantLoss()
-    loss = loss_fn(depth, target)
-    print(f"Scale-invariant loss: {loss.item():.4f}")
+    # Test ResNet
+    print("\nTesting ResNet...")
+    model_res = DepthResNet(model_name="resnet50.a1_in1k", img_size=224)
+    x = torch.randn(2, 3, 224, 224)
+    depth, emb = model_res(x, return_embedding=True)
+    print(f"ResNet Output: {depth.shape}, Emb: {emb.shape}")

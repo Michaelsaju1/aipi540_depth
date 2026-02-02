@@ -13,6 +13,11 @@ For RTX Pro 6000 (48GB), recommended settings:
     - vit_small: bs=16, V_global=2, V_local=4
 """
 
+import sys
+import os
+# Add project root to sys.path
+sys.path.append(os.path.join(os.path.dirname(__file__), "../.."))
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,10 +28,11 @@ import argparse
 import logging
 import tqdm
 import wandb
+from src.utils.metrics import compute_metrics
 
-from depth_ds import DepthDataset, collate_depth, collate_depth_multiview
-from depth_model import DepthViT, ScaleInvariantLoss
-from loss import SIGReg
+from src.data.depth_ds import DepthDataset, collate_depth, collate_depth_multiview
+from src.models.depth_model import DepthViT, ScaleInvariantLoss
+from src.losses.loss import SIGReg
 
 logging.basicConfig(level=logging.INFO)
 
@@ -60,8 +66,8 @@ def LeJEPA_Depth(global_proj, all_proj, sigreg, lamb):
     sigreg_losses = []
     for i in range(all_proj.shape[1]):
         view_emb = all_proj[:, i, :]  # (N, D)
-        # SIGReg expects float32
-        l = sigreg(view_emb.float())
+        # Use consistent dtype (likely bfloat16)
+        l = sigreg(view_emb)
         sigreg_losses.append(l)
     sigreg_loss = torch.stack(sigreg_losses).mean()
     
@@ -81,6 +87,11 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--grad_accum", type=int, default=1)
+    parser.add_argument("--prefetch_factor", type=int, default=4)
+
+    # parser.add_argument("--full_size", type=bool, default=True)
+    parser.add_argument("--max_img_size", type=int, default=224)
+
     
     # JEPA parameters
     parser.add_argument("--V_global", type=int, default=2, help="Number of global views")
@@ -98,32 +109,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def compute_metrics(pred, target):
-    """Compute depth estimation metrics."""
-    pred = pred.detach()
-    target = target.detach()
-    
-    eps = 1e-6
-    pred = pred.clamp(min=eps)
-    target = target.clamp(min=eps)
-    
-    abs_rel = torch.mean(torch.abs(pred - target) / target)
-    rmse = torch.sqrt(torch.mean((pred - target) ** 2))
-    
-    ratio = torch.max(pred / target, target / pred)
-    delta1 = (ratio < 1.25).float().mean()
-    delta2 = (ratio < 1.25 ** 2).float().mean()
-    delta3 = (ratio < 1.25 ** 3).float().mean()
-    
-    return {
-        "abs_rel": abs_rel.item(),
-        "rmse": rmse.item(),
-        "delta1": delta1.item(),
-        "delta2": delta2.item(),
-        "delta3": delta3.item(),
-    }
-
-
 def main():
     args = parse_args()
     
@@ -134,29 +119,22 @@ def main():
     
     device = torch.device(args.device)
     
-    # Parse neighborhoods
-    neighborhoods = None
-    if args.neighborhoods:
-        neighborhoods = [int(n) for n in args.neighborhoods.split(",")]
-    
     # Datasets
     logging.info("Loading datasets...")
     train_ds = DepthDataset(
         split="train",
         global_img_size=args.global_img_size,
         local_img_size=args.local_img_size,
-        neighborhoods=neighborhoods,
         V_global=args.V_global,
         V_local=args.V_local,
         multi_view=True,  # Enable JEPA multi-view
     )
     
-    # Validation uses single view
+    # Validation uses single view (which now returns patches)
     val_ds = DepthDataset(
         split="val",
         global_img_size=args.global_img_size,
         local_img_size=args.local_img_size,
-        neighborhoods=neighborhoods,
         multi_view=False,
     )
     
@@ -167,17 +145,19 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
+        prefetch_factor=args.prefetch_factor,
         collate_fn=collate_depth_multiview,  # Multi-view collate for training
         persistent_workers=args.num_workers > 0,
     )
     
     val_loader = DataLoader(
         val_ds,
-        batch_size=args.bs,
+        batch_size=8,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
-        collate_fn=collate_depth,  # Single view collate for validation
+        prefetch_factor=args.prefetch_factor,
+        collate_fn=collate_depth,  # Single view collate (handles patch stacking)
     )
     
     logging.info(f"Train: {len(train_ds)} samples, Val: {len(val_ds)} samples")
@@ -193,9 +173,11 @@ def main():
     
     # Convert to bfloat16
     model = model.to(torch.bfloat16)
+    model = torch.compile(model)
     
     # SIGReg module (same as in run_JEPA.py)
     sigreg = SIGReg().to(device)
+    sigreg = sigreg.to(torch.bfloat16)
     
     # Loss functions
     depth_loss_fn = ScaleInvariantLoss(lambd=0.5)
@@ -331,23 +313,48 @@ def main():
         # Validation
         model.eval()
         val_metrics = {"abs_rel": 0, "rmse": 0, "delta1": 0, "delta2": 0, "delta3": 0}
-        num_val = 0
+        num_val_images = 0
         
         with torch.inference_mode():
-            for images, depths in tqdm.tqdm(val_loader, desc="Validation"):
+            # Validation loader now returns patch_counts for each batch
+            for images, depths, patch_counts in tqdm.tqdm(val_loader, desc="Validation"):
+                # images: (Total_Patches, 3, H, W)
                 images = images.to(device, dtype=torch.bfloat16, non_blocking=True)
                 depths = depths.to(device, dtype=torch.bfloat16, non_blocking=True)
                 
                 with autocast(device_type="cuda", dtype=torch.bfloat16):
-                    pred_depth = model(images, return_embedding=False)
+                    pred = model(images, return_embedding=False)
                 
-                metrics = compute_metrics(pred_depth, depths)
-                for k, v in metrics.items():
-                    val_metrics[k] += v * images.size(0)
-                num_val += images.size(0)
-        
-        for k in val_metrics:
-            val_metrics[k] /= num_val
+                # Iterate through images in the batch by slicing using patch_counts
+                current_idx = 0
+                for count in patch_counts:
+                    # Slice patches for the current image
+                    img_pred = pred[current_idx : current_idx + count]
+                    img_target = depths[current_idx : current_idx + count]
+                    current_idx += count
+                    
+                    if count == 0:
+                        continue
+                        
+                    # Compute aggregated stats for this single image (composed of N patches)
+                    # We pass 'count' largely to satisfy the signature if needed, 
+                    # but compute_metrics sums over whatever tensor it gets.
+                    img_stats = compute_metrics(img_pred, img_target, count)
+                    
+                    # Compute per-image final metrics
+                    n = img_stats["n_pixels"]
+                    if n > 0:
+                        val_metrics["abs_rel"] += img_stats["abs_rel_sum"] / n
+                        val_metrics["rmse"] += (img_stats["sq_diff_sum"] / n) ** 0.5
+                        val_metrics["delta1"] += img_stats["delta1_sum"] / n
+                        val_metrics["delta2"] += img_stats["delta2_sum"] / n
+                        val_metrics["delta3"] += img_stats["delta3_sum"] / n
+                        num_val_images += 1
+
+        # Average over number of images
+        if num_val_images > 0:
+            for k in val_metrics:
+                val_metrics[k] /= num_val_images
         
         logging.info(f"Val - AbsRel: {val_metrics['abs_rel']:.4f}, RMSE: {val_metrics['rmse']:.4f}, "
                     f"δ1: {val_metrics['delta1']:.4f}")
@@ -367,6 +374,15 @@ def main():
             }, args.save_path)
             logging.info(f"Saved best model with δ1={best_delta1:.4f}")
     
+
+    # test_ds = DepthDataset(
+    #     split="test",
+    #     global_img_size=args.global_img_size,
+    #     local_img_size=args.local_img_size,
+    #     multi_view=False,
+    # )    
+
+
     if args.wandb:
         wandb.finish()
     

@@ -5,5 +5,7 @@
 /wandb
 *__pycache__
 /checkpoints
-*logs
+*/logs
 # *test_results
+
+*.

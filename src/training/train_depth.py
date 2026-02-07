@@ -9,6 +9,10 @@ For RTX Pro 6000 (48GB), recommended settings:
     - vit_base:  bs=16, img_size=224
 """
 
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), "../.."))
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,6 +23,7 @@ import argparse
 import logging
 import tqdm
 import wandb
+from src.utils.metrics import compute_metrics
 
 from src.data.depth_ds import DepthDataset, collate_depth
 from src.models.depth_model import get_depth_model, ScaleInvariantLoss, DepthSmoothL1Loss
@@ -41,7 +46,7 @@ def parse_args():
     parser.add_argument("--neighborhoods", type=str, default=None, 
                        help="Comma-separated list of neighborhood IDs, e.g. '0,1,2'")
     parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
-    parser.add_argument("--save_path", type=str, default="checkpoints/depth_model.pt")
+    parser.add_argument("--save_path", type=str, default="checkpoints/depth_model2.pt")
     return parser.parse_args()
 
 
@@ -65,13 +70,13 @@ def main():
     logging.info("Loading datasets...")
     train_ds = DepthDataset(
         split="train", 
-        img_size=args.img_size,
-        neighborhoods=neighborhoods,
+        global_img_size=args.img_size,
+        multi_view=False,
     )
     val_ds = DepthDataset(
         split="val",
-        img_size=args.img_size,
-        neighborhoods=neighborhoods,
+        global_img_size=args.img_size,
+        multi_view=False,
     )
     
     train_loader = DataLoader(
@@ -158,7 +163,7 @@ def main():
         pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
         optimizer.zero_grad()
         
-        for batch_idx, (images, depths) in enumerate(pbar):
+        for batch_idx, (images, depths, _, _) in enumerate(pbar):
             images = images.to(device, dtype=torch.bfloat16, non_blocking=True)
             depths = depths.to(device, dtype=torch.bfloat16, non_blocking=True)
             
@@ -206,11 +211,10 @@ def main():
         
         # Validation
         model.eval()
-        val_metrics = {"abs_rel": 0, "rmse": 0, "delta1": 0, "delta2": 0, "delta3": 0}
-        num_val = 0
+        val_acc = {"abs_rel_sum": 0, "sq_diff_sum": 0, "delta1_sum": 0, "delta2_sum": 0, "delta3_sum": 0, "n_pixels": 0}
         
         with torch.inference_mode():
-            for images, depths in tqdm.tqdm(val_loader, desc="Validation"):
+            for images, depths, _, _ in tqdm.tqdm(val_loader, desc="Validation"):
                 images = images.to(device, dtype=torch.bfloat16, non_blocking=True)
                 depths = depths.to(device, dtype=torch.bfloat16, non_blocking=True)
                 
@@ -219,12 +223,17 @@ def main():
                 
                 metrics = compute_metrics(pred_depth, depths)
                 for k, v in metrics.items():
-                    val_metrics[k] += v * images.size(0)
-                num_val += images.size(0)
+                    val_acc[k] += v
         
-        # Average metrics
-        for k in val_metrics:
-            val_metrics[k] /= num_val
+        # Compute final metrics from accumulated sums
+        n = val_acc["n_pixels"]
+        val_metrics = {
+            "abs_rel": val_acc["abs_rel_sum"] / n if n > 0 else 0,
+            "rmse": (val_acc["sq_diff_sum"] / n) ** 0.5 if n > 0 else 0,
+            "delta1": val_acc["delta1_sum"] / n if n > 0 else 0,
+            "delta2": val_acc["delta2_sum"] / n if n > 0 else 0,
+            "delta3": val_acc["delta3_sum"] / n if n > 0 else 0,
+        }
         
         logging.info(f"Val - AbsRel: {val_metrics['abs_rel']:.4f}, RMSE: {val_metrics['rmse']:.4f}, "
                     f"δ1: {val_metrics['delta1']:.4f}, δ2: {val_metrics['delta2']:.4f}")

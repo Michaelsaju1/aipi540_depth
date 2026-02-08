@@ -1,25 +1,11 @@
 #!/bin/bash
-
-​
-
 set -xu
 
-​
+allCommand=""
 
-allCommand=
-
-while [ "$#" -gt 0 ];
-
-do
-
-    allCommand=" $allCommand $1 "
-
+while [ "$#" -gt 0 ]; do
+    allCommand="$allCommand $1"
     shift
-
 done
 
-​
-
 $allCommand
-
-

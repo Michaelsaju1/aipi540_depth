@@ -78,8 +78,8 @@ def LeJEPA_Depth(global_proj, all_proj, sigreg, lamb):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train depth estimation with JEPA")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--bs", type=int, default=16, help="Batch size")
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--bs", type=int, default=128, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--global_img_size", type=int, default=224)
     parser.add_argument("--local_img_size", type=int, default=96)
@@ -105,7 +105,8 @@ def parse_args():
     parser.add_argument("--neighborhoods", type=str, default=None,
                        help="Comma-separated list of neighborhood IDs")
     parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
-    parser.add_argument("--save_path", type=str, default="checkpoints/depth_jepa.pt")
+    parser.add_argument("--save_path", type=str, default="checkpoints/depth_jepa2.pt")
+    # parser.add_argument("--detach", type=str, default=True)
     return parser.parse_args()
 
 
@@ -159,6 +160,7 @@ def main():
         prefetch_factor=args.prefetch_factor,
         collate_fn=collate_depth,  # Single view collate (handles patch stacking)
     )
+    detach=True
     
     logging.info(f"Train: {len(train_ds)} samples, Val: {len(val_ds)} samples")
     logging.info(f"Views: {args.V_global} global + {args.V_local} local")
@@ -205,12 +207,12 @@ def main():
     )
     
     # W&B
-    if args.wandb:
-        wandb.init(
-            project="AIPI_540_Depth_JEPA",
-            name=f"jepa_{args.model.split('.')[0]}_V{args.V_global}+{args.V_local}",
-            config=vars(args),
-        )
+    # if args.wandb:
+    wandb.init(
+        project="AIPI_540_Depth_JEPA",
+        name=f"jepa_{args.model.split('.')[0]}_V{args.V_global}+{args.V_local}",
+        config=vars(args),
+    )
     
     # Training loop
     global_step = 0
@@ -249,6 +251,8 @@ def main():
                 
                 for img in all_imgs:
                     pred_depth, emb = model(img, return_embedding=True)
+                    if detach:
+                        pred_depth = pred_depth.detach()
                     all_pred_depths.append(pred_depth)
                     all_embeddings.append(emb)
                 
@@ -296,8 +300,8 @@ def main():
                     "train/sigreg_loss": sigreg_loss.item(),
                     "train/lr": optimizer.param_groups[0]["lr"],
                 }
-                if args.wandb:
-                    wandb.log(log_dict, step=global_step)
+                # if args.wandb:
+                wandb.log(log_dict, step=global_step)
                 pbar.set_postfix(
                     depth=depth_loss.item(),
                     jepa=jepa_loss.item(),
@@ -317,7 +321,7 @@ def main():
         
         with torch.inference_mode():
             # Validation loader now returns patch_counts for each batch
-            for images, depths, patch_counts in tqdm.tqdm(val_loader, desc="Validation"):
+            for images, depths, patch_counts, shapes in tqdm.tqdm(val_loader, desc="Validation"):
                 # images: (Total_Patches, 3, H, W)
                 images = images.to(device, dtype=torch.bfloat16, non_blocking=True)
                 depths = depths.to(device, dtype=torch.bfloat16, non_blocking=True)
@@ -359,8 +363,8 @@ def main():
         logging.info(f"Val - AbsRel: {val_metrics['abs_rel']:.4f}, RMSE: {val_metrics['rmse']:.4f}, "
                     f"δ1: {val_metrics['delta1']:.4f}")
         
-        if args.wandb:
-            wandb.log({f"val/{k}": v for k, v in val_metrics.items()}, step=global_step)
+        # if args.wandb:
+        wandb.log({f"val/{k}": v for k, v in val_metrics.items()}, step=global_step)
         
         # Save best model
         if val_metrics["delta1"] > best_delta1:
@@ -383,8 +387,8 @@ def main():
     # )    
 
 
-    if args.wandb:
-        wandb.finish()
+    # if args.wandb:
+    wandb.finish()
     
     logging.info(f"Training complete. Best δ1: {best_delta1:.4f}")
 
